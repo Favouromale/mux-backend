@@ -34,12 +34,17 @@ export class MaintenanceGuard implements CanActivate {
       return true;
     }
 
+    const wasEnabled = this.cachedState?.enabled ?? false;
     const maintenanceState = await this.getMaintenanceState();
-    
+
     if (maintenanceState.enabled) {
-      this.logger.warn(
-        `Maintenance mode enabled - rejecting ${method} request to ${request.url}`,
-      );
+      // Log once per transition into maintenance, not once per rejected request.
+      // Log the route template only: no resource ids or query string.
+      if (!wasEnabled) {
+        this.logger.warn(
+          `Maintenance mode enabled - rejecting ${method} request to ${request.route?.path ?? request.path}`,
+        );
+      }
       
       const retryAfterSeconds =
         maintenanceState.retryAfterSeconds ?? DEFAULT_MAINTENANCE_RETRY_AFTER_SECONDS;
