@@ -29,6 +29,7 @@ import type {
   AssetSelector,
   BalanceAssetType,
   BalanceSweepResult,
+  BalanceSyncStatus,
   ReconciliationResult,
   StaleBalanceReport,
   WalletBalanceRecord,
@@ -60,16 +61,14 @@ export interface ImportCursorState {
 @Injectable()
 export class BalanceIndexerService {
   private readonly logger = new Logger(BalanceIndexerService.name);
-  private prisma: PrismaClient;
   private readonly staleThresholdMs: number;
 
   constructor(
     private readonly stellarHorizonService: StellarHorizonService,
     private readonly configService: ConfigService,
     private readonly webhookEventEmitter: WebhookEventEmitterService,
+    private readonly prisma: PrismaService,
   ) {
-    this.prisma = new PrismaClient({} as any);
-
     // Consider balances stale after 5 minutes
     this.staleThresholdMs = this.configService.get<number>(
       'BALANCE_STALE_THRESHOLD_MS',
