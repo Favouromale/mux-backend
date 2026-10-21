@@ -1,11 +1,13 @@
 import {
   BadRequestException,
 import { randomUUID } from 'crypto';
+import {
+  BadRequestException,
   Injectable,
   Logger,
   NotFoundException,
-} from '@nestjs/common';
   ConflictException,
+} from '@nestjs/common';
   Injectable,
   Logger,
   NotFoundException,
@@ -24,6 +26,7 @@ import { Transaction as TransactionEntity } from './entities/transaction.entity'
 import { ErrorCode } from '../common/dto/error-envelope.dto';
 import { InsufficientBalanceException } from './domain/insufficient-balance.exception';
 import { WebhookEventEmitterService } from '../webhooks/webhook-event-emitter.service';
+import { WalletStatus } from '../wallets/domain/wallet.model';
 
 /** Cursor-based page of transactions */
 export interface TransactionPage {
@@ -54,9 +57,14 @@ export class TransactionsService {
    * existing transaction is returned without side-effects. A key already used
    * by a different sender wallet is rejected with 409 (IDEMPOTENCY_CONFLICT)
    * so another wallet's transaction is never exposed.
+   *
+   * The sender wallet must be owned by `callerDeveloperId` (taken from the API
+   * key context, never the body) and both wallets must be ACTIVE. An ownership
+   * miss is reported as WALLET_NOT_FOUND so wallet existence is not leaked.
    */
   async create(
     createTransactionDto: CreateTransactionDto,
+    callerDeveloperId: string,
   ): Promise<TransactionEntity> {
     this.assertValidAmount(createTransactionDto.amount);
 
@@ -89,15 +97,25 @@ export class TransactionsService {
       }
     }
 
-    // Validate sender wallet exists
+    // Validate sender wallet exists, is owned by the caller and is ACTIVE.
+    // Ownership misses are treated as not found to avoid leaking existence.
     const senderWallet = await this.prisma.wallet.findUnique({
       where: { id: senderWalletId },
     });
-    if (!senderWallet) {
-      throw new NotFoundException(`Sender wallet ${senderWalletId} not found`);
+    if (!senderWallet || senderWallet.userId !== callerDeveloperId) {
+      throw new NotFoundException({
+        errorCode: 'WALLET_NOT_FOUND',
+        message: `Sender wallet ${senderWalletId} not found for this developer`,
+      });
+    }
+    if (senderWallet.status !== WalletStatus.ACTIVE) {
+      throw new BadRequestException({
+        errorCode: 'WALLET_NOT_ACTIVE',
+        message: `Sender wallet is not active (status: ${senderWallet.status})`,
+      });
     }
 
-    // Validate receiver wallet exists (if supplied)
+    // Validate receiver wallet exists and is ACTIVE (if supplied)
     if (receiverWalletId) {
       const receiverWallet = await this.prisma.wallet.findUnique({
         where: { id: receiverWalletId },
@@ -106,6 +124,12 @@ export class TransactionsService {
         throw new NotFoundException(
           `Receiver wallet ${receiverWalletId} not found`,
         );
+      }
+      if (receiverWallet.status !== WalletStatus.ACTIVE) {
+        throw new BadRequestException({
+          errorCode: 'WALLET_NOT_ACTIVE',
+          message: `Receiver wallet is not active (status: ${receiverWallet.status})`,
+        });
       }
     }
 
