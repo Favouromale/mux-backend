@@ -305,9 +305,10 @@ export class TransactionsService {
         updateDto.status,
       )
     ) {
-      throw new BadRequestException(
-        `Invalid status transition: ${existing.status} -> ${updateDto.status}`,
-      );
+      throw new ConflictException({
+        errorCode: 'TRANSACTION_STATUS_TRANSITION_INVALID',
+        message: `Invalid status transition: ${existing.status} -> ${updateDto.status}`,
+      });
     }
 
     const updateData: any = {
