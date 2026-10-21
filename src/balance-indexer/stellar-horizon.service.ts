@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Asset, AssetType, BalanceUpdate } from './domain/balance.model';
+import { horizonErrorStatus } from './horizon-retry.policy';
 import { BalanceIndexerErrorCode } from './balance-indexer.error-codes';
 
 /**
@@ -32,6 +33,22 @@ export interface HorizonBalance {
   balance: string;
   /** Paging token attached to this balance entry (if Horizon provides one) */
   paging_token?: string;
+}
+
+/**
+ * Failure from a Horizon read. Keeps the HTTP status (when one exists) so the
+ * retry policy and callers can classify it without parsing the message, and
+ * the original error reachable via `cause`.
+ */
+export class HorizonRequestError extends Error {
+  constructor(
+    message: string,
+    readonly statusCode: number | undefined,
+    readonly cause: unknown,
+  ) {
+    super(message);
+    this.name = 'HorizonRequestError';
+  }
 }
 
 /**
@@ -92,7 +109,11 @@ export class StellarHorizonService {
       if (error instanceof HorizonAssetParseError) {
         throw error;
       }
-      throw new Error(`Horizon API request failed: ${error.message}`);
+      throw new HorizonRequestError(
+        `Horizon API request failed: ${error.message}`,
+        horizonErrorStatus(error),
+        error,
+      );
     }
   }
 
@@ -104,7 +125,7 @@ export class StellarHorizonService {
       await this.mockHorizonRequest(publicKey);
       return true;
     } catch (error) {
-      if (error.message.includes('404')) {
+      if (horizonErrorStatus(error) === 404) {
         return false;
       }
       throw error;
@@ -206,7 +227,6 @@ export class StellarHorizonService {
     };
   }
 }
-
 export interface HorizonAccountResponse {
   id: string;
   sequence: string;
@@ -371,3 +391,4 @@ export class StellarHorizonService {
     };
   }
 }
+
