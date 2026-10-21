@@ -159,8 +159,8 @@ export interface BalanceStore {
   wallet: {
     findUnique(args: {
       where: { id: string };
-      select?: { id: true; publicKey: true };
-    }): Promise<{ id: string; publicKey: string } | null>;
+      select?: { id: true; publicKey: true; userId: true };
+    }): Promise<{ id: string; publicKey: string; userId: string } | null>;
     findMany(args: {
       where: { status: string };
       select?: { id: true; publicKey: true };

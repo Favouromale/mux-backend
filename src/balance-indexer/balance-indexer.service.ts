@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   HttpException,
   Inject,
   Injectable,
@@ -27,6 +28,7 @@ import type {
 } from './balance-indexer.error-codes';
 import type {
   AssetSelector,
+  BalanceActor,
   BalanceAssetType,
   BalanceSweepResult,
   BalanceSyncStatus,
@@ -642,8 +644,9 @@ export interface SyncBalancesResult {
  * 3. **Writes are feature-flagged.** `BALANCE_SYNC_ENABLED` defaults to OFF;
  *    reads still work, but no indexed balance is mutated until an operator
  *    opts in.
- * 4. **Deny-by-default authz.** Sweeps require an operator/owner role. The
- *    caller never asserts wallet ownership; the service resolves it.
+ * 4. **Deny-by-default authz.** Sweeps and writes require the `operator` role.
+ *    Wallet-scoped reads require ownership or `operator`. The caller never
+ *    asserts wallet ownership; the service resolves it from the stored wallet.
  * 5. **Idempotent.** Reconciliation is a pure compare-and-flag: re-running it
  *    on unchanged data produces the same state and the same response, so a
  *    replayed or concurrent request is harmless.
@@ -677,8 +680,12 @@ export class BalanceIndexerService {
   }
 
   /** Cached balances for a wallet. */
-  async getAllBalances(walletId: string): Promise<WalletBalanceRecord[]> {
+  async getAllBalances(
+    actor: BalanceActor,
+    walletId: string,
+  ): Promise<WalletBalanceRecord[]> {
     this.assertValidWalletId(walletId);
+    await this.enforceAuthorization(actor, walletId);
     const rows = await this.withDependencyGuard(
       `balances.read wallet=${walletId}`,
       () =>
@@ -692,10 +699,12 @@ export class BalanceIndexerService {
 
   /** Cached balance for a single asset of a wallet. */
   async getBalance(
+    actor: BalanceActor,
     walletId: string,
     asset: AssetSelector,
   ): Promise<WalletBalanceRecord | null> {
     this.assertValidWalletId(walletId);
+    await this.enforceAuthorization(actor, walletId);
     const row = await this.withDependencyGuard(
       `balances.readAsset wallet=${walletId}`,
       () =>
@@ -718,12 +727,16 @@ export class BalanceIndexerService {
    * `BALANCE_DEPENDENCY_UNAVAILABLE` and no row is written, so a Horizon
    * outage degrades freshness rather than corrupting balances.
    */
-  async syncWalletBalances(options: {
-    walletId: string;
-    forceRefresh?: boolean;
-  }): Promise<WalletSyncResult> {
+  async syncWalletBalances(
+    actor: BalanceActor,
+    options: {
+      walletId: string;
+      forceRefresh?: boolean;
+    },
+  ): Promise<WalletSyncResult> {
     const { walletId, forceRefresh = false } = options ?? { walletId: '' };
     this.assertValidWalletId(walletId);
+    await this.enforceAuthorization(actor);
     this.assertWritesEnabled('balances.sync');
 
     const wallet = await this.requireWallet(walletId, 'balances.sync');
@@ -803,10 +816,12 @@ export class BalanceIndexerService {
    * decides which side is right. Reconciliation only records the discrepancy.
    */
   async reconcileBalance(
+    actor: BalanceActor,
     walletId: string,
     asset: AssetSelector,
   ): Promise<ReconciliationResult> {
     this.assertValidWalletId(walletId);
+    await this.enforceAuthorization(actor);
     this.assertWritesEnabled('balances.reconcile');
 
     const wallet = await this.requireWallet(walletId, 'balances.reconcile');
@@ -863,7 +878,8 @@ export class BalanceIndexerService {
   }
 
   /** Reconcile every indexed balance across every active wallet. */
-  async reconcileAllBalances(): Promise<BalanceSweepResult> {
+  async reconcileAllBalances(actor: BalanceActor): Promise<BalanceSweepResult> {
+    await this.enforceAuthorization(actor);
     const wallets = await this.loadSweepWallets('balances.reconcileAll');
 
     let balancesUpdated = 0;
@@ -879,7 +895,7 @@ export class BalanceIndexerService {
       );
 
       for (const row of rows) {
-        const result = await this.reconcileBalance(wallet.id, {
+        const result = await this.reconcileBalance(actor, wallet.id, {
           type: row.assetType as BalanceAssetType,
           code: row.assetCode ?? undefined,
           issuer: row.assetIssuer ?? undefined,
@@ -905,14 +921,15 @@ export class BalanceIndexerService {
   }
 
   /** Sync every active wallet. */
-  async syncAllWallets(): Promise<BalanceSweepResult> {
+  async syncAllWallets(actor: BalanceActor): Promise<BalanceSweepResult> {
+    await this.enforceAuthorization(actor);
     const wallets = await this.loadSweepWallets('balances.syncAll');
 
     let balancesUpdated = 0;
     let mismatchesFound = 0;
 
     for (const wallet of wallets) {
-      const result = await this.syncWalletBalances({
+      const result = await this.syncWalletBalances(actor, {
         walletId: wallet.id,
         forceRefresh: true,
       });
@@ -935,18 +952,21 @@ export class BalanceIndexerService {
    * and is surfaced immediately rather than hammered, so a bad wallet id cannot
    * turn into a retry storm.
    */
-  async syncWalletBalancesWithRetry(options: {
-    walletId: string;
-    forceRefresh?: boolean;
-    maxAttempts?: number;
-  }): Promise<WalletSyncResult> {
+  async syncWalletBalancesWithRetry(
+    actor: BalanceActor,
+    options: {
+      walletId: string;
+      forceRefresh?: boolean;
+      maxAttempts?: number;
+    },
+  ): Promise<WalletSyncResult> {
     const { maxAttempts = 3 } = options ?? { maxAttempts: 3 };
     const attempts = Math.min(Math.max(1, maxAttempts), 5);
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
-        return await this.syncWalletBalances(options);
+        return await this.syncWalletBalances(actor, options);
       } catch (err) {
         lastError = err;
         const retryable = this.isRetryable(err);
@@ -971,8 +991,12 @@ export class BalanceIndexerService {
   }
 
   /** Report balances for a wallet that have not been refreshed recently. */
-  async detectStaleBalances(walletId: string): Promise<StaleBalanceReport> {
+  async detectStaleBalances(
+    actor: BalanceActor,
+    walletId: string,
+  ): Promise<StaleBalanceReport> {
     this.assertValidWalletId(walletId);
+    await this.enforceAuthorization(actor, walletId);
 
     const rows = await this.withDependencyGuard(
       `balances.stale wallet=${walletId}`,
@@ -1016,7 +1040,8 @@ export class BalanceIndexerService {
    * wallet failing (e.g. a Horizon 404 for a closed account) must not abort the
    * whole run. Failures are counted in metrics and logged, never swallowed.
    */
-  async runScheduledSync(): Promise<void> {
+  async runScheduledSync(actor: BalanceActor): Promise<void> {
+    await this.enforceAuthorization(actor);
     this.logger.log('balances.scheduledSync start');
     let processed = 0;
 
@@ -1031,7 +1056,7 @@ export class BalanceIndexerService {
 
     for (const wallet of wallets) {
       try {
-        await this.syncWalletBalances({
+        await this.syncWalletBalances(actor, {
           walletId: wallet.id,
           forceRefresh: false,
         });
@@ -1062,13 +1087,13 @@ export class BalanceIndexerService {
   private async requireWallet(
     walletId: string,
     operation: string,
-  ): Promise<{ id: string; publicKey: string }> {
+  ): Promise<{ id: string; publicKey: string; userId: string }> {
     const wallet = await this.withDependencyGuard(
       `${operation}.walletLookup`,
       () =>
         this.prisma.wallet.findUnique({
           where: { id: walletId },
-          select: { id: true, publicKey: true },
+          select: { id: true, publicKey: true, userId: true },
         }),
     );
 
@@ -1233,6 +1258,72 @@ export class BalanceIndexerService {
       code: BalanceIndexerErrorCode.FEATURE_FLAG_DISABLED,
       message: `Balance writes are disabled; set ${BALANCE_SYNC_ENABLED_ENV}=true to enable`,
     });
+  }
+
+  /**
+   * Deny-by-default authz gate.
+   *
+   * Without a `walletId` this guards sweeps and writes: only an `operator`
+   * passes. With a `walletId` it guards a wallet-scoped read: the actor must own
+   * the wallet or hold `operator`. Ownership is resolved from the stored wallet
+   * row, never from a caller-supplied claim. A missing wallet is denied exactly
+   * like a foreign one, so the check does not reveal which wallet ids exist.
+   */
+  private async enforceAuthorization(
+    actor: BalanceActor,
+    walletId?: string,
+  ): Promise<void> {
+    if (!actor?.subjectId) {
+      throw this.authorizationDenied(
+        actor,
+        BalanceIndexerErrorCode.NOT_AUTHORIZED,
+        'Caller is not authorized for this balance operation',
+        walletId,
+      );
+    }
+    if (actor.role === 'operator') {
+      return;
+    }
+    if (walletId === undefined) {
+      throw this.authorizationDenied(
+        actor,
+        BalanceIndexerErrorCode.INSUFFICIENT_ROLE,
+        'This balance operation requires the operator role',
+      );
+    }
+
+    const wallet = await this.withDependencyGuard(
+      `balances.authz wallet=${walletId}`,
+      () =>
+        this.prisma.wallet.findUnique({
+          where: { id: walletId },
+          select: { id: true, publicKey: true, userId: true },
+        }),
+    );
+    if (wallet?.userId === actor.subjectId) {
+      return;
+    }
+    throw this.authorizationDenied(
+      actor,
+      BalanceIndexerErrorCode.NOT_AUTHORIZED,
+      'Caller is not authorized for this balance operation',
+      walletId,
+    );
+  }
+
+  /** Records a denial and builds the envelope; the caller throws it. */
+  private authorizationDenied(
+    actor: BalanceActor | undefined,
+    code: BalanceIndexerErrorCode,
+    message: string,
+    walletId?: string,
+  ): ForbiddenException {
+    this.metrics.incrementCounter('balance_authz_denied');
+    this.logger.warn(
+      `balances.authz denied code=${code} scope=${walletId ?? 'sweep'} ` +
+        `role=${actor?.role ?? 'none'} correlationId=${actor?.correlationId ?? 'none'}`,
+    );
+    return new ForbiddenException({ code, message });
   }
 
   /** True when at least one asset was synced within the staleness budget. */
