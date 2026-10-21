@@ -10,7 +10,10 @@ import {
   UseGuards,
   Query,
   Logger,
+  Req,
+  UnauthorizedException,
 } from '@nestjs/common';
+import type { Request } from 'express';
 import { FeeSponsorshipService } from './fee-sponsorship.service';
 import { CreateFeeSponsorshipBudgetDto } from './dto/create-fee-sponsorship-budget.dto';
 import { UpdateFeeSponsorshipBudgetDto } from './dto/update-fee-sponsorship-budget.dto';
@@ -20,6 +23,11 @@ import {
 } from './dto/fee-sponsorship-budget-response.dto';
 import { ListFeeSponsorshipBudgetsQueryDto } from './dto/list-fee-sponsorship-budgets-query.dto';
 import { ApiKeyGuard } from '../api-keys/api-key.guard';
+import {
+  FeeSponsorshipNetwork,
+  SponsorshipActor,
+} from './domain/fee-sponsorship-budget.model';
+import { FeeSponsorshipErrorCode } from './fee-sponsorship-error-codes';
 import { randomUUID } from 'crypto';
 
 /**
@@ -54,8 +62,9 @@ export class FeeSponsorshipController {
   @UseGuards(ApiKeyGuard)
   async createBudget(
     @Body() body: CreateFeeSponsorshipBudgetDto,
+    @Req() req: Request,
   ): Promise<FeeSponsorshipBudgetResponse> {
-    const actor = this.extractActor(body);
+    const actor = this.extractActor(req, body.idempotencyKey);
     const result = await this.feeSponsorshipService.createBudget(body, actor);
     return this.toResponse(result);
   }
@@ -71,9 +80,10 @@ export class FeeSponsorshipController {
   @UseGuards(ApiKeyGuard)
   async getBudget(
     @Param('id') id: string,
-    @Query('idempotencyKey') idempotencyKey?: string,
+    @Query('idempotencyKey') idempotencyKey: string | undefined,
+    @Req() req: Request,
   ): Promise<FeeSponsorshipBudgetResponse> {
-    const actor = this.extractActor({ idempotencyKey });
+    const actor = this.extractActor(req, idempotencyKey);
     const result = await this.feeSponsorshipService.getBudget(id, actor);
     return this.toResponse(result);
   }
@@ -117,8 +127,9 @@ export class FeeSponsorshipController {
   async updateBudget(
     @Param('id') id: string,
     @Body() body: UpdateFeeSponsorshipBudgetDto,
+    @Req() req: Request,
   ): Promise<FeeSponsorshipBudgetResponse> {
-    const actor = this.extractActor(body);
+    const actor = this.extractActor(req, body.idempotencyKey);
     const result = await this.feeSponsorshipService.updateBudget(id, body, actor);
     return this.toResponse(result);
   }
@@ -137,26 +148,34 @@ export class FeeSponsorshipController {
   async closeBudget(
     @Param('id') id: string,
     @Body() body: { idempotencyKey?: string },
+    @Req() req: Request,
   ): Promise<FeeSponsorshipBudgetResponse> {
-    const actor = this.extractActor(body);
+    const actor = this.extractActor(req, body.idempotencyKey);
     const result = await this.feeSponsorshipService.closeBudget(id, actor);
     return this.toResponse(result);
   }
 
   /**
-   * Extract actor context from the request.
-   * In production, this would be populated by the auth guard.
-   * For now, we extract what we can from the request body/query.
+   * Derive the actor from the API key authenticated by ApiKeyGuard.
+   *
+   * The subject is the developer that owns the key. Client-supplied body or
+   * query fields are never trusted for identity; they are only used as the
+   * budget's sponsor field and checked against this subject in the service.
+   * Requests with no resolvable developer are rejected, never attributed to a
+   * placeholder subject.
    */
-  private extractActor(source: Record<string, unknown>): {
-    subjectId: string;
-    role: 'owner' | 'delegate' | 'guardian' | 'api-key' | 'jwt';
-    correlationId?: string;
-  } {
+  private extractActor(req: Request, idempotencyKey?: string): SponsorshipActor {
+    const developerId: unknown = (req as any).apiKeyContext?.developerId;
+    if (typeof developerId !== 'string' || developerId.length === 0) {
+      throw new UnauthorizedException({
+        code: FeeSponsorshipErrorCode.UNATTRIBUTED_ACTOR,
+        message: 'Request is not attributable to an authenticated developer',
+      });
+    }
     return {
-      subjectId: (source as any).sponsorId ?? 'unknown',
-      role: 'api-key',
-      correlationId: (source as any).idempotencyKey,
+      subjectId: developerId,
+      role: 'owner',
+      correlationId: idempotencyKey,
     };
   }
 
