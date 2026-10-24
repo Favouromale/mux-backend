@@ -23,7 +23,7 @@ export interface ValidatedEnv {
   /** Optional Prisma `connect_timeout` in seconds (#951). */
   DATABASE_CONNECT_TIMEOUT_SECONDS?: number;
   CORS_ORIGINS: string;
-  MAINNET_PAYMENT_ENABLED: string;
+  MAINNET_PAYMENT_ENABLED: boolean;
   NODE_ENV: string;
   LOG_LEVEL: string;
 }
@@ -42,7 +42,7 @@ const DEFAULTS = {
   PORT: 3000,
   JSON_BODY_LIMIT_BYTES: 1024 * 1024, // 1MB
   CORS_ORIGINS: 'http://localhost:3000',
-  MAINNET_PAYMENT_ENABLED: 'false',
+  MAINNET_PAYMENT_ENABLED: false,
   NODE_ENV: 'development',
   LOG_LEVEL: 'info',
 } as const;
@@ -58,6 +58,34 @@ function parseBoolean(value: string | undefined, fallback: boolean): boolean {
   if (['0', 'false', 'no', 'off'].includes(normalized)) {
     return false;
   }
+  return fallback;
+}
+
+/**
+ * Parses a boolean env var, pushing a named error when the value is present
+ * but not one of the accepted truthy/falsy tokens. Returns the fallback when
+ * absent. Used for fail-closed switches where a typo must not silently
+ * resolve to disabled.
+ */
+function parseRequiredBoolean(
+  value: string | undefined,
+  fallback: boolean,
+  variable: string,
+  errors: string[],
+): boolean {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+  errors.push(
+    `${variable} must be one of: true, false, 1, 0, yes, no, on, off`,
+  );
   return fallback;
 }
 
@@ -165,9 +193,13 @@ export function validateEnv(
 
   // --- Optional variables with defaults ---
 
-  const MAINNET_PAYMENTS_ENABLED = parseBoolean(
-    env.MAINNET_PAYMENTS_ENABLED,
+  // Canonical mainnet payment enable switch (#1181). Must match the name read
+  // by resolveMainnetPaymentFlag() in src/config/configuration.ts.
+  const MAINNET_PAYMENT_ENABLED = parseRequiredBoolean(
+    env.MAINNET_PAYMENT_ENABLED,
     false,
+    'MAINNET_PAYMENT_ENABLED',
+    errors,
   );
   const BALANCE_SYNC_INTERVAL_MS = parseNumber(
     env.BALANCE_SYNC_INTERVAL_MS,
@@ -270,16 +302,7 @@ export function validateEnv(
     }
     if (OTEL_ENABLED && !OTEL_EXPORTER_OTLP_ENDPOINT) {
       errors.push(
-        'OTEL_EXPORTER_OTLP_ENDPOINT is required when OTEL_ENABLED=true',
-      );
-    } else if (OTEL_EXPORTER_OTLP_ENDPOINT) {
-      try {
-        new URL(OTEL_EXPORTER_OTLP_ENDPOINT);
-      } catch {
-        errors.push('OTEL_EXPORTER_OTLP_ENDPOINT must be a valid URL');
-      }
-    }
-  }
+        'OTEL_EXPORTER_OTLP_ENDPOINT is re
 
   const AUTH_SKIP_JWT_VERIFICATION = parseBoolean(
     env.AUTH_SKIP_JWT_VERIFICATION,
